@@ -47,30 +47,79 @@
     );
   }
 
-  function setSpeed(rate) {
+  // The speed we're actively holding the video at. null = not enforcing, so
+  // YouTube's native presets behave normally.
+  let desiredRate = null;
+
+  function applyRate(rate) {
     const player = document.getElementById("movie_player");
+    // Drive it exactly like YouTube's own +/- slider does. That control accepts
+    // fine-grained rates (e.g. 2.75) and updates the readout, so setPlaybackRate
+    // does support off-preset values here — getAvailablePlaybackRates() only
+    // reports the old coarse list, so we do NOT gate on it.
     try {
       player && player.setPlaybackRate && player.setPlaybackRate(rate);
     } catch (_) {
-      /* API may reject non-preset rates; direct set below is the source of truth */
+      /* ignore */
     }
     const v = getVideo();
-    if (v) {
+    if (v && Math.abs(v.playbackRate - rate) > 1e-3) {
       try {
         v.playbackRate = rate;
       } catch (_) {
         /* ignore */
       }
     }
-    LOG("set playbackRate ->", rate, "actual:", v ? v.playbackRate : "(no video)");
+    return v;
+  }
+
+  // Whenever the rate drifts off our target (YouTube trying to reset it), put
+  // it back. Attached to the current media element's ratechange event.
+  function enforceRate() {
+    if (desiredRate == null) return;
+    const v = getVideo();
+    if (v && Math.abs(v.playbackRate - desiredRate) > 1e-3) {
+      try {
+        v.playbackRate = desiredRate;
+      } catch (_) {
+        /* ignore */
+      }
+    }
+  }
+
+  function setSpeed(rate) {
+    desiredRate = rate;
+    const v = applyRate(rate);
+    if (v) {
+      v.removeEventListener("ratechange", enforceRate);
+      v.addEventListener("ratechange", enforceRate);
+    }
+    LOG("set playbackRate ->", rate, "actual:", v ? v.playbackRate : "(no video)", "enforcing");
+  }
+
+  // Stop holding a custom rate the moment the user touches a native speed
+  // control (a native chip, the slider, or the +/- buttons), so their choice
+  // sticks instead of being fought by our enforcement.
+  function releaseOnNativeSpeedUI(e) {
+    const t = e.target;
+    if (!(t instanceof Element)) return;
+    if (t.closest(`[${MARK}]`)) return; // one of our chips — keep enforcing
+    if (t.closest(".ytp-speed-panel-chips, .ytp-speed-slider, input[type='range'], .ytp-speedmaster-slider-container")) {
+      if (desiredRate != null) LOG("native speed control used — releasing enforcement");
+      desiredRate = null;
+    }
   }
 
   // ------- helpers for the chips panel -------
 
+  const isVisible = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+
   function chipButtons(panel) {
     return Array.from(panel.querySelectorAll("button")).filter((b) => {
       const t = b.textContent.trim();
-      return /^\d/.test(t) && rateOf(t) !== null;
+      // Visible only: YouTube keeps hidden buttons for its full rate set
+      // (including 1.75), and counting those would make us skip adding 1.75.
+      return /^\d/.test(t) && rateOf(t) !== null && isVisible(b);
     });
   }
 
@@ -93,7 +142,6 @@
 
   function buildChip(templateWrapper, rate, panel) {
     const clone = templateWrapper.cloneNode(true);
-    clone.setAttribute(MARK, String(rate));
     const btn = clone.matches("button") ? clone : clone.querySelector("button");
     if (!btn) return null;
 
@@ -103,15 +151,35 @@
       if (child.nodeType === 1 && child.contains(btn)) continue;
       child.remove();
     }
+
+    // Strip every attribute except styling. The clone came from a native chip,
+    // and YouTube's own click handler reads those attributes (data-*, jsaction,
+    // etc.) to decide which speed was picked — so a click on our chip would set
+    // the *template's* speed (e.g. 1.25). Removing them neutralizes that.
+    for (const el of [clone, ...clone.querySelectorAll("*")]) {
+      for (const name of Array.from(el.getAttributeNames())) {
+        if (name === "class" || name === "style") continue;
+        el.removeAttribute(name);
+      }
+    }
+    clone.setAttribute(MARK, String(rate));
     btn.setAttribute("aria-pressed", "false");
     btn.setAttribute("aria-label", `Playback speed ${rate}`);
     btn.textContent = fmt(rate);
-    btn.addEventListener("click", (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      setSpeed(rate);
-      updateReadout(panel, rate);
-    });
+
+    // Capture phase + stopImmediatePropagation so the event never reaches any
+    // YouTube handler; only our own runs.
+    btn.addEventListener(
+      "click",
+      (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+        setSpeed(rate);
+        updateReadout(panel, rate);
+      },
+      true
+    );
     return clone;
   }
 
@@ -337,6 +405,50 @@
       push(`menu #${i}: ${items.length} items = [${labels.map((l) => JSON.stringify(l)).join(", ")}]`);
     });
 
+    // --- how does THIS player set speed? ---
+    const player = document.getElementById("movie_player");
+    const v = getVideo();
+    push("--- speed API probe ---");
+    push("video.playbackRate (before):", v ? v.playbackRate : "(no video)");
+    let avail = "(none)";
+    try {
+      avail = player && player.getAvailablePlaybackRates ? JSON.stringify(player.getAvailablePlaybackRates()) : "(no method)";
+    } catch (e) {
+      avail = "threw: " + e;
+    }
+    push("getAvailablePlaybackRates():", avail);
+    try {
+      player.setPlaybackRate(2.75);
+      push("called setPlaybackRate(2.75) — no throw");
+    } catch (e) {
+      push("setPlaybackRate(2.75) threw:", String(e));
+    }
+    // report the result shortly after, once YouTube has reacted
+    setTimeout(() => {
+      const vv = getVideo();
+      LOG("PROBE result: video.playbackRate 250ms after setPlaybackRate(2.75) =", vv ? vv.playbackRate : "(no video)");
+    }, 250);
+
+    // --- controls present in the open speed panel ---
+    const openPanel = Array.from(document.querySelectorAll(".ytp-settings-menu, .ytp-popup, .ytp-panel")).find(
+      (p) => chipButtons(p).length
+    );
+    push("--- speed panel controls ---");
+    if (openPanel) {
+      const ranges = openPanel.querySelectorAll("input[type='range'], [role='slider']");
+      push("sliders:", ranges.length);
+      ranges.forEach((r, i) =>
+        push(`  slider#${i} <${r.tagName.toLowerCase()} class="${r.className}"> value=${r.value} min=${r.min} max=${r.max} aria-valuenow=${r.getAttribute("aria-valuenow")}`)
+      );
+      const allBtns = Array.from(openPanel.querySelectorAll("button"));
+      push("all buttons in panel:", allBtns.length);
+      allBtns.forEach((b, i) =>
+        push(`  btn#${i} text=${JSON.stringify(b.textContent.trim())} aria-label=${JSON.stringify(b.getAttribute("aria-label"))} class="${b.className}"`)
+      );
+    } else {
+      push("no open speed panel found — open Playback speed first, then run this");
+    }
+
     const text = out.join("\n");
     console.log(text);
     return text;
@@ -344,6 +456,7 @@
 
   function start() {
     window.ytSpeedDebug = ytSpeedDebug;
+    document.addEventListener("pointerdown", releaseOnNativeSpeedUI, true);
     observer = new MutationObserver(onMutation);
     observeRoot();
     scan();
